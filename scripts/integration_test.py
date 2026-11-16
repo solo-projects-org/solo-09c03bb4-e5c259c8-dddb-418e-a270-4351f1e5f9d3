@@ -11,6 +11,7 @@
   6. 慢上传期间另一实例仍可接收与查询（不阻塞）
   7. 配额不足 507
   8. 崩溃回收：伪造孤儿暂存后调 /admin/reconcile 被清理
+  9. 变更事件流：发布/撤回/同号重入湖顺序、游标分页、跨实例一致、失败无事件
 """
 
 from __future__ import annotations
@@ -230,6 +231,65 @@ def main() -> int:
     check("失败记录保持 UPLOADING 可重传",
           states.get("IT-BADLEN") == "UPLOADING"
           and states.get("IT-BADPARQUET") == "UPLOADING", str(states))
+
+    print("== 9. 变更事件流：发布/撤回/同号重入湖 ==")
+    # 同号删除后以相同内容重新入湖：必须先撤回旧件再发布新件
+    chg_rid = "IT-CHG1"
+    d3, sha3 = make_parquet("p3.parquet", salt=7.0)
+    req("PUT", BASE1, f"/receipts/{chg_rid}/declaration", decl(chg_rid, d3, sha3))
+    code, body, _ = req("POST", BASE1, f"/receipts/{chg_rid}/content", d3, raw=True)
+    check("IT-CHG1 首次发布", code == 200
+          and json.loads(body)["state"] == "PUBLISHED", body[:160].decode())
+    code, _, _ = req("DELETE", BASE2, f"/receipts/{chg_rid}")
+    check("IT-CHG1 经实例2 删除", code == 204, str(code))
+    req("PUT", BASE2, f"/receipts/{chg_rid}/declaration", decl(chg_rid, d3, sha3))
+    code, body, _ = req("POST", BASE2, f"/receipts/{chg_rid}/content", d3, raw=True)
+    check("IT-CHG1 同摘要重新入湖", code == 200
+          and json.loads(body)["state"] == "PUBLISHED", body[:160].decode())
+
+    def walk(base: str, page: int) -> list[dict]:
+        events, cursor = [], 0
+        while True:
+            c, b, _ = req("GET", base, f"/changes?cursor={cursor}&limit={page}")
+            assert c == 200, f"/changes 返回 {c}: {b[:200]!r}"
+            payload = json.loads(b)
+            events.extend(payload["events"])
+            cursor = payload["next_cursor"]
+            if not payload["has_more"]:
+                return events
+
+    events1 = walk(BASE1, 1000)
+    events2 = walk(BASE2, 1000)
+    check("实例2 事件流与实例1 一致", events1 == events2)
+    paged = walk(BASE1, 2)
+    check("游标分页（每页 2 条）与整读一致、不多不漏", paged == events1)
+
+    seqs = [e["seq"] for e in events1]
+    check("事件 seq 严格递增（只追加）",
+          seqs == sorted(seqs) and len(set(seqs)) == len(seqs), str(seqs))
+
+    chg = [e for e in events1 if e["receipt_id"] == chg_rid]
+    check("同号重入湖事件序列为 发布→撤回→发布",
+          [e["event"] for e in chg] == ["PUBLISHED", "WITHDRAWN", "PUBLISHED"],
+          str([(e["event"], e["reason"]) for e in chg]))
+    if len(chg) == 3:
+        p1, w, p2 = chg
+        check("撤回指向旧发布、新发布标识不同",
+              w["publication_id"] == p1["publication_id"]
+              and p2["publication_id"] != p1["publication_id"]
+              and w["reason"] == "receipt_deleted")
+        check("事件快照五要素正确",
+              all(e["station_id"] == "BUOY-IT1" and e["obs_date"] == "2026-11-15"
+                  and e["sha256"] == sha3 and e["row_count"] == 24 for e in chg))
+
+    bad_events = [e for e in events1
+                  if e["receipt_id"] in ("IT-BADLEN", "IT-BADPARQUET")]
+    check("未成功的变更不产生事件", bad_events == [], str(bad_events))
+
+    published_rids = {e["receipt_id"] for e in events1 if e["event"] == "PUBLISHED"}
+    check("已生效发布全部在事件流中",
+          {"IT-R1", "IT-R2", "IT-SLOW", "IT-WHILE-SLOW", chg_rid} <= published_rids,
+          str(published_rids))
 
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0

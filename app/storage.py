@@ -17,11 +17,12 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import uuid
 from contextlib import contextmanager
 from typing import Iterator
 
 from .config import Settings
-from .db import Database
+from .db import Database, insert_change_event
 from .errors import ObsError, ReceiptBusy
 
 
@@ -163,7 +164,8 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
     修复项：
     1. 暂存区里没有对应 UPLOADING 接收的文件（含其他实例崩溃残留）→ 删除；
     2. UPLOADING 接收缺失暂存文件（写盘/登记中断）→ 清零进度，接收可重传；
-    3. 已发布接收缺成品文件 → 回退为 UPLOADING 并解除 blob 引用，
+    3. 已发布接收缺成品文件 → 同事务登记 WITHDRAWN 事件并回退为 UPLOADING、
+       解除 blob 引用；共享原件缺失时引用它的所有接收逐一撤回，
        绝不允许存在“成功记录但缺件”；
     4. 无任何接收引用的 blob → 删除并注销；
     5. 数据库与磁盘不一致的 blob 条目 → 按磁盘真相修正。
@@ -181,14 +183,14 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
                     "SELECT receipt_id, bytes_received FROM receipts WHERE state = 'UPLOADING'"
                 ).fetchall()
             }
-            published_missing: list[str] = []
+            published_missing: list[dict] = []
             for r in conn.execute(
-                "SELECT receipt_id, blob_sha256 FROM receipts WHERE state = 'PUBLISHED'"
+                "SELECT * FROM receipts WHERE state = 'PUBLISHED'"
             ).fetchall():
                 if not r["blob_sha256"] or not os.path.isfile(
                     blob_path(settings, r["blob_sha256"])
                 ):
-                    published_missing.append(r["receipt_id"])
+                    published_missing.append(dict(r))
 
             # 1 & 2：暂存区对账
             live_staging = set()
@@ -210,21 +212,32 @@ def reconcile(settings: Settings, db: Database) -> dict[str, int]:
                     )
                     reset_receipts += 1
 
-            # 3：缺件的“已发布”记录回退为可重传
-            for receipt_id in published_missing:
-                row = conn.execute(
-                    "SELECT blob_sha256 FROM receipts WHERE receipt_id = ?",
-                    (receipt_id,),
-                ).fetchone()
-                sha = row["blob_sha256"] if row else None
+            # 3：缺件的“已发布”记录逐条撤回（同事务登记事件）并回退为可重传。
+            # 共享同一 blob 的接收会因同一缺件路径全部进入本列表，即
+            # “共享原件缺失须撤回所有关联接收”。
+            for rec in published_missing:
+                receipt_id = rec["receipt_id"]
+                sha = rec["blob_sha256"]
                 if sha:
                     conn.execute(
                         "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE sha256 = ?",
                         (sha,),
                     )
+                insert_change_event(
+                    conn,
+                    event="WITHDRAWN",
+                    receipt_id=receipt_id,
+                    station_id=rec["station_id"],
+                    obs_date=rec["obs_date"],
+                    sha256=sha or rec["declared_sha256"],
+                    row_count=rec["row_count"] if rec["row_count"] is not None else 0,
+                    publication_id=rec["publication_id"] or uuid.uuid4().hex,
+                    reason="blob_missing",
+                )
                 conn.execute(
                     "UPDATE receipts SET state = 'UPLOADING', bytes_received = 0, "
                     "actual_sha256 = NULL, blob_sha256 = NULL, row_count = NULL, "
+                    "publication_id = NULL, "
                     "last_error = '成品文件缺失，已自动回退为待上传，请重新上传', "
                     "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                     "WHERE receipt_id = ?",

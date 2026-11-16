@@ -19,6 +19,7 @@ from .config import Settings, load_settings
 from .db import Database
 from .errors import ObsError
 from .schemas import (
+    ChangesPageOut,
     DeclarationIn,
     QuotaOut,
     ReceiptOut,
@@ -32,6 +33,7 @@ from .service import (
     delete_receipt,
     get_quota,
     get_receipt,
+    list_changes,
     list_receipts,
     shutdown_io_pool,
     upload_package,
@@ -84,7 +86,9 @@ app = FastAPI(
         "- 同号同声明重试沿用原记录，异声明拒绝（409）；\n"
         "- 相同内容跨接收只存一份（内容寻址），不重复占额；\n"
         "- 空间不足返回 507；校验失败无可下载成品；\n"
-        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收。"
+        "- 双实例共享存储，崩溃残留由启动与周期对账自动回收；\n"
+        "- `GET /changes` 为下游数仓提供自启用时起记录的发布/撤回事件流，"
+        "游标分页、只追加、不可变。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -238,6 +242,25 @@ async def remove(receipt_id: str):
 async def quota() -> QuotaOut:
     row = await _offload(get_quota, settings, db)
     return QuotaOut(**row)
+
+
+@app.get(
+    "/changes",
+    response_model=ChangesPageOut,
+    tags=["下游同步"],
+    summary="变更事件流（游标分页，自启用时起记录）",
+)
+async def changes(
+    cursor: int = Query(0, ge=0, description="游标：只返回 seq 大于它的事件，0 表示从头"),
+    limit: int = Query(100, ge=1, le=1000, description="单页最大事件数"),
+) -> ChangesPageOut:
+    """数仓下游同步用：按 seq 升序给出发布/撤回事件。
+
+    事件与状态变更同事务登记：未成功的变更不会产生事件，已生效的变更
+    不漏记不重复；事件一经返回不可变，后来的变更只追加在其后。
+    """
+    page = await _offload(list_changes, db, cursor=cursor, limit=limit)
+    return ChangesPageOut(**page)
 
 
 @app.post(

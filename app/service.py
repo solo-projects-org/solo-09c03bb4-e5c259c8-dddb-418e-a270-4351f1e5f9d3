@@ -6,12 +6,13 @@ import asyncio
 import datetime as dt
 import hashlib
 import os
+import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 from .config import Settings
-from .db import Database
+from .db import Database, insert_change_event
 from .errors import (
     AlreadyFinalized,
     ContentMismatch,
@@ -210,7 +211,11 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
                 "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
             ).fetchone()
             if row["state"] == _PUBLISHED:
+                # 幂等重试：已发布直接返回，不重复登记事件
                 return _row_to_dict(row)
+            # 每次发布生成全新的发布标识：同号删除后重新入湖（即使摘要相同）
+            # 也是一次新发布，撤回旧件的事件不会指向它。
+            publication_id = uuid.uuid4().hex
             sha = row["declared_sha256"]
             target = blob_path(settings, sha)
             blob_row = conn.execute(
@@ -245,9 +250,23 @@ def _publish(settings: Settings, db: Database, receipt: dict) -> dict:
                 )
             conn.execute(
                 "UPDATE receipts SET state = 'PUBLISHED', blob_sha256 = ?, row_count = ?, "
-                "last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "publication_id = ?, last_error = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "WHERE receipt_id = ?",
-                (sha, result.row_count, receipt_id),
+                (sha, result.row_count, publication_id, receipt_id),
+            )
+            # 发布生效与事件登记同事务：崩溃只可能两者一起回滚，
+            # 不会出现“已发布无事件”或“有事件未发布”。
+            insert_change_event(
+                conn,
+                event="PUBLISHED",
+                receipt_id=receipt_id,
+                station_id=row["station_id"],
+                obs_date=row["obs_date"],
+                sha256=sha,
+                row_count=result.row_count,
+                publication_id=publication_id,
+                reason="published",
             )
             published = _row_to_dict(
                 conn.execute(
@@ -424,21 +443,55 @@ def delete_receipt(settings: Settings, db: Database, receipt_id: str) -> None:
                 ).fetchone()
                 if row is None:
                     raise ReceiptNotFound(f"接收号 {receipt_id} 不存在")
-                if row["state"] == _PUBLISHED and row["blob_sha256"]:
+                if row["state"] == _PUBLISHED:
                     sha = row["blob_sha256"]
-                    conn.execute(
-                        "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE sha256 = ?",
-                        (sha,),
+                    if sha:
+                        conn.execute(
+                            "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) "
+                            "WHERE sha256 = ?",
+                            (sha,),
+                        )
+                        blob = conn.execute(
+                            "SELECT ref_count FROM blobs WHERE sha256 = ?", (sha,)
+                        ).fetchone()
+                        if blob is not None and blob["ref_count"] == 0:
+                            safe_remove(blob_path(settings, sha))
+                            conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha,))
+                    # 撤回已发布原件：与删除同事务登记，删除重试（404）不会重复记事件。
+                    # 摘要取当时发布的 blob_sha256（正常等于声明摘要），
+                    # 与 PUBLISHED 事件保持一致。
+                    insert_change_event(
+                        conn,
+                        event="WITHDRAWN",
+                        receipt_id=receipt_id,
+                        station_id=row["station_id"],
+                        obs_date=row["obs_date"],
+                        sha256=sha or row["declared_sha256"],
+                        row_count=row["row_count"] if row["row_count"] is not None else 0,
+                        publication_id=row["publication_id"] or uuid.uuid4().hex,
+                        reason="receipt_deleted",
                     )
-                    blob = conn.execute(
-                        "SELECT ref_count FROM blobs WHERE sha256 = ?", (sha,)
-                    ).fetchone()
-                    if blob is not None and blob["ref_count"] == 0:
-                        safe_remove(blob_path(settings, sha))
-                        conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha,))
                 conn.execute("DELETE FROM receipts WHERE receipt_id = ?", (receipt_id,))
             safe_remove(staging_path(settings, receipt_id))
 
 
 def get_quota(settings: Settings, db: Database) -> dict:
     return current_usage(settings, db)
+
+
+def list_changes(db: Database, *, cursor: int, limit: int) -> dict:
+    """按游标读取变更事件流：返回 seq > cursor 的事件，升序、只追加。
+
+    事件一经提交不可变（数据库触发器保证），后来的变更只追加在尾部，
+    因此同一游标重复读取永远得到相同结果。多取一条用于判定 has_more。
+    """
+    rows = db.query_all(
+        "SELECT seq, event, receipt_id, station_id, obs_date, sha256, row_count, "
+        "publication_id, reason, recorded_at FROM changes "
+        "WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        (cursor, limit + 1),
+    )
+    has_more = len(rows) > limit
+    events = [_row_to_dict(r) for r in rows[:limit]]
+    next_cursor = events[-1]["seq"] if events else cursor
+    return {"events": events, "next_cursor": next_cursor, "has_more": has_more}

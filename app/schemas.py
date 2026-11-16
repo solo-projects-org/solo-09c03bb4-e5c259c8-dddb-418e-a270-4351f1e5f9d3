@@ -73,3 +73,32 @@ class ReconcileOut(BaseModel):
     removed_staging_files: int
     removed_orphan_blobs: int
     reset_receipts: int
+
+
+class ChangeEventOut(BaseModel):
+    """一条变更事件：发布或撤回，快照当时的五要素与发布标识。"""
+
+    seq: int = Field(..., description="单调递增事件序号，即分页游标")
+    event: str = Field(..., description="PUBLISHED=发布；WITHDRAWN=撤回")
+    receipt_id: str = Field(..., description="接收号")
+    station_id: str = Field(..., description="浮标站号")
+    obs_date: str = Field(..., description="观测 UTC 日期 YYYY-MM-DD")
+    sha256: str = Field(..., description="原包 SHA-256")
+    row_count: int = Field(..., description="原包行数")
+    publication_id: str = Field(
+        ...,
+        description="发布标识：每次发布唯一；撤回事件指向被撤的那次发布，"
+        "同号重新入湖的新发布有不同标识，按序应用不会误撤新件",
+    )
+    reason: str = Field(
+        ...,
+        description="published=正常发布；receipt_deleted=接收被删除；"
+        "blob_missing=对账发现共享原件缺失",
+    )
+    recorded_at: str = Field(..., description="事件登记时间 UTC")
+
+
+class ChangesPageOut(BaseModel):
+    events: list[ChangeEventOut]
+    next_cursor: int = Field(..., description="下一页游标（本页最后一条事件的 seq）")
+    has_more: bool = Field(..., description="是否还有更多事件")
